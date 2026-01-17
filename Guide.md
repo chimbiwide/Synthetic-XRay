@@ -258,6 +258,26 @@ The **hf-vision/chest-xray-pneumonia** dataset contains:
 - **Split**: Train / Val / Test folders
 - **Source**: Pediatric patients (1-5 years) from Guangzhou hospital
 - **License**: CC-BY-4.0
+- **Image dimensions**: Varies (multiple sizes in dataset)
+
+### Preprocessing Considerations
+
+⚠️ **Important**: The dataset contains images of varying dimensions. Direct resizing to a square (e.g., `Resize((512, 512))`) can distort aspect ratios and affect image quality.
+
+**Solution**: Use `Resize(size)` + `CenterCrop(size)` which:
+1. Resizes the **shortest edge** to target size (preserving aspect ratio)
+2. Center crops to a square (safe for chest X-rays since lungs are centered)
+
+```python
+# ❌ BAD - can distort aspect ratio
+transforms.Resize((512, 512))
+
+# ✅ GOOD - preserves aspect ratio, then crops
+transforms.Compose([
+    transforms.Resize(512),      # Shortest edge = 512
+    transforms.CenterCrop(512),  # Square center crop
+])
+```
 
 ### Loading the Dataset
 
@@ -278,46 +298,98 @@ print(dataset)
 # Labels: 0 = NORMAL, 1 = PNEUMONIA
 ```
 
+### Handling Different Image Dimensions
+
+The chest X-ray dataset contains images of varying dimensions. Direct resizing to a square can distort aspect ratios, so we use **Resize + CenterCrop** which:
+1. Resizes the shortest edge to target size (preserving aspect ratio)
+2. Center crops to a square (lungs are centered, so minimal info loss)
+
+This is the standard approach for medical imaging preprocessing.
+
 ### Preprocessing for Diffusion Model Training
 
 ```python
 from torchvision import transforms
 from PIL import Image
 import os
+import json
 from tqdm import tqdm
+from collections import Counter
+
+def analyze_dataset_dimensions(dataset):
+    """Check the dimension distribution in the dataset."""
+    dimensions = []
+    for sample in dataset['train']:
+        w, h = sample['image'].size
+        dimensions.append((w, h))
+    
+    dim_counts = Counter(dimensions)
+    print(f"Unique dimensions: {len(dim_counts)}")
+    print("\nMost common:")
+    for dim, count in dim_counts.most_common(10):
+        ratio = dim[0] / dim[1]
+        print(f"  {dim[0]}×{dim[1]} (ratio: {ratio:.2f}) — {count} images")
+    
+    return dim_counts
 
 def prepare_training_data(dataset, output_dir, target_size=512):
     """
-    Prepare images for DreamBooth training.
-    Saves images to separate folders by class.
+    Prepare images for DreamBooth training with proper aspect ratio handling.
+    Uses Resize + CenterCrop to avoid distortion.
     """
     os.makedirs(f"{output_dir}/normal", exist_ok=True)
     os.makedirs(f"{output_dir}/pneumonia", exist_ok=True)
     
+    # Resize shortest edge to target_size, then center crop to square
+    # This preserves aspect ratio and keeps the centered lung region
     transform = transforms.Compose([
-        transforms.Resize((target_size, target_size)),
+        transforms.Resize(target_size),      # Shortest edge = target_size
+        transforms.CenterCrop(target_size),  # Square crop from center
     ])
+    
+    # Track original dimensions (useful for science fair report!)
+    dimension_log = []
     
     for idx, sample in enumerate(tqdm(dataset['train'], desc="Preparing data")):
         img = sample['image']
         label = sample['label']
         
+        # Log original size
+        dimension_log.append({
+            'idx': idx,
+            'original_size': img.size,
+            'label': 'normal' if label == 0 else 'pneumonia'
+        })
+        
         # Convert to RGB if grayscale
         if img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Transform
+        # Transform (resize + center crop)
         img = transform(img)
         
         # Save
         class_name = "normal" if label == 0 else "pneumonia"
         img.save(f"{output_dir}/{class_name}/{idx:05d}.png")
     
-    print(f"Saved images to {output_dir}")
+    # Save dimension log
+    with open(f"{output_dir}/dimension_log.json", 'w') as f:
+        json.dump(dimension_log, f, indent=2)
+    
+    # Print summary
+    dims = [tuple(d['original_size']) for d in dimension_log]
+    unique_dims = len(set(dims))
+    print(f"\nSaved {len(dimension_log)} images to {output_dir}")
+    print(f"Original data had {unique_dims} unique dimensions")
+    print(f"All images now standardized to {target_size}×{target_size}")
+    
     return output_dir
 
-# Prepare data
-prepare_training_data(dataset, "./cxr_training_data")
+# Analyze dimensions first (optional but informative)
+analyze_dataset_dimensions(dataset)
+
+# Prepare data with proper preprocessing
+prepare_training_data(dataset, "./cxr_training_data", target_size=512)
 ```
 
 ### Creating Class Images for Prior Preservation
@@ -787,11 +859,14 @@ class ChestXrayDataset(Dataset):
 
 
 def get_transforms(train=True):
-    """Get image transforms."""
+    """
+    Get image transforms with proper aspect ratio handling.
+    Uses Resize (shortest edge) + CenterCrop to avoid distortion.
+    """
     if train:
         return transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.Resize(256),           # Shortest edge = 256 (preserves ratio)
+            transforms.CenterCrop(224),       # Square crop from center
             transforms.RandomHorizontalFlip(),
             transforms.RandomRotation(10),
             transforms.ColorJitter(brightness=0.1, contrast=0.1),
@@ -800,8 +875,8 @@ def get_transforms(train=True):
         ])
     else:
         return transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.CenterCrop(224),
+            transforms.Resize(256),           # Shortest edge = 256
+            transforms.CenterCrop(224),       # Square crop from center
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
@@ -1154,19 +1229,33 @@ import os
 from tqdm import tqdm
 from PIL import Image
 from torchvision import transforms
+from collections import Counter
 
 dataset = load_dataset("hf-vision/chest-xray-pneumonia")
+
+# Check dimension distribution
+print("Analyzing dataset dimensions...")
+dimensions = [(s['image'].size, s['label']) for s in dataset['train']]
+unique_dims = len(set(d[0] for d in dimensions))
+print(f"Found {unique_dims} unique image dimensions")
 
 os.makedirs("./data/normal", exist_ok=True)
 os.makedirs("./data/pneumonia", exist_ok=True)
 
-transform = transforms.Resize((512, 512))
+# Use Resize + CenterCrop to handle varying dimensions properly
+# This preserves aspect ratio and keeps centered lung region
+transform = transforms.Compose([
+    transforms.Resize(512),       # Shortest edge = 512
+    transforms.CenterCrop(512),   # Square crop from center
+])
 
-for idx, sample in enumerate(tqdm(dataset['train'])):
+for idx, sample in enumerate(tqdm(dataset['train'], desc="Preparing images")):
     img = sample['image'].convert('RGB')
     img = transform(img)
     label = 'normal' if sample['label'] == 0 else 'pneumonia'
     img.save(f"./data/{label}/{idx:05d}.png")
+
+print(f"All images standardized to 512×512")
 
 # CELL 3: Clone diffusers and install
 !git clone https://github.com/huggingface/diffusers
